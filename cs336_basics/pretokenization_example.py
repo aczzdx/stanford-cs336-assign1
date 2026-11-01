@@ -1,6 +1,11 @@
 import os
 from typing import BinaryIO
 
+# import tqdm based on different platform
+from tqdm.std import tqdm, trange
+import click
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -27,7 +32,7 @@ def find_chunk_boundaries(
 
     mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
 
-    for bi in range(1, len(chunk_boundaries) - 1):
+    for bi in trange(1, len(chunk_boundaries) - 1):
         initial_position = chunk_boundaries[bi]
         file.seek(initial_position)  # Start at boundary guess
         while True:
@@ -50,6 +55,7 @@ def find_chunk_boundaries(
 
 
 ## Usage
+"""
 with open(..., "rb") as f:
     num_processes = 4
     boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
@@ -60,3 +66,4 @@ with open(..., "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
         # Run pre-tokenization on your chunk and store the counts for each pre-token
+"""
