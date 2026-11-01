@@ -64,7 +64,7 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def pretokenize(idx: int, start: int, end: int, data_file_path: str, q: mp.Queue[Any]) -> None:
+def pretokenize(idx: int, start: int, end: int, data_file_path: str, q: mp.Queue) -> None:
     
     with open(data_file_path, "rb") as f:
             
@@ -86,7 +86,7 @@ def init_vocab() -> dict[int, bytes]:
     
     return ret
 
-def queue_listener_merger(q: mp.Queue[Any]) -> dict[int, bytes]:
+def queue_listener_merger(q: mp.Queue) -> dict[int, bytes]:
     
     ret = init_vocab()
     
@@ -122,7 +122,7 @@ def run_train_bpe(
     click.echo(
         f"num_process = {num_processes}, data_file_path={data_file_path}"
     )
-    
+
     start_ns = time.perf_counter_ns()
     train_bpe(num_processes, data_file_path, num_chunks)
     end_ns = time.perf_counter_ns()
