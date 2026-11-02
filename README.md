@@ -1,6 +1,6 @@
 # NOTICE
 
-This is a private copy cloned from [Standford CS336 Assignment 1 - Basics GitHub repo](https://github.com/stanford-cs336/assignment1-basics)
+This is just personal copy cloned from [Standford CS336 Assignment 1 - Basics GitHub repo](https://github.com/stanford-cs336/assignment1-basics)
 
 # CS336 Spring 2025 Assignment 1: Basics
 
