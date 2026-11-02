@@ -2,14 +2,24 @@ import multiprocessing as mp
 import os
 import time
 import re
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, TypedDict, Literal, DefaultDict
+from collections import defaultdict
 # import tqdm based on different platform
-from tqdm.std import trange
+from tqdm.std import trange, tqdm
 import click
 
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 END_OF_TEXT_TOKEN = b"<|endoftext|>"
+
+class QueueMsg(TypedDict):
+    action_type: Literal["stop", "merge"]
+    payload: Any
+
+FrequencyTableDefualtDict = DefaultDict[bytes, int]
+FrequencyTable = dict[bytes, int]
+
+VocabTable = dict[int, bytes]
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -64,16 +74,15 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def pretokenize(idx: int, start: int, end: int, data_file_path: str, q: mp.Queue) -> None:
+def pretokenize(idx: int, start: int, end: int, data_file_path: str) -> FrequencyTable:
     
-    with open(data_file_path, "rb") as f:
-            
+    with open(data_file_path, "rb") as f:       
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
 
-    test_msg = f"chunk_size={len(chunk)}"
-    ret: tuple[int, list[bytes]] = (idx, [test_msg.encode('utf-8')])
-    q.put(ret)
+    return defaultdict(int, {b"test": idx})
+
+def wrapped_pretokenize(args): return pretokenize(*args)
 
 def init_vocab() -> dict[int, bytes]:
     ret: dict[int, bytes] = {}
@@ -86,12 +95,12 @@ def init_vocab() -> dict[int, bytes]:
     
     return ret
 
-def queue_listener_merger(q: mp.Queue) -> dict[int, bytes]:
-    
-    ret = init_vocab()
-    
-    return ret
-    
+def merge_frequency_table(lhs: FrequencyTableDefualtDict, rhs: FrequencyTable) -> FrequencyTableDefualtDict:
+
+    for subtoken, freq in rhs.items():
+        lhs[subtoken] += freq
+    return lhs
+
 def train_bpe(
     num_processes: int,
     data_file_path: str,
@@ -100,14 +109,24 @@ def train_bpe(
     with open(data_file_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, num_chunks, [END_OF_TEXT_TOKEN])
 
-    with mp.Pool(num_processes) as pool, mp.Manager() as manager:
-        q = manager.Queue()
+    freq_table: FrequencyTableDefualtDict = defaultdict(int)
+
+    with mp.Pool(num_processes) as pool:
         params = [
             (i, start_end_pair[0], start_end_pair[1], data_file_path, q)
             for i, start_end_pair in enumerate(zip(boundaries[:-1], boundaries[1:]))
         ]
         
-        pool.starmap(pretokenize, params)
+        for partial_freq_table in tqdm(
+            pool.imap_unordered(wrapped_pretokenize, params),
+            total=len(params)
+        ):
+            merge_frequency_table(freq_table, partial_freq_table)
+
+    # Stats of freq_table
+    click.echo(f"Number of chucks: {len(params)}")
+    click.echo(f"Number of sub-tokens: {len(freq_table.keys())}")
+    
         
         
 @click.command()
