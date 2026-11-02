@@ -1,20 +1,21 @@
 import multiprocessing as mp
 import os
 import time
-import re
-from typing import Any, BinaryIO, TypedDict, Literal, DefaultDict
+import regex as re
+from typing import Any, BinaryIO, Iterable, TypedDict, Literal, DefaultDict
 from collections import defaultdict
 # import tqdm based on different platform
 from tqdm.std import trange, tqdm
 import click
+import pickle as pkl
+import itertools
 
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-END_OF_TEXT_TOKEN = b"<|endoftext|>"
+PAT_REGEX = re.compile(PAT)
+FREQ_TABLE_PKL_FILEPATH = "data/freq_table.pkl"
 
-class QueueMsg(TypedDict):
-    action_type: Literal["stop", "merge"]
-    payload: Any
+END_OF_TEXT_TOKEN = "<|endoftext|>"
 
 FrequencyTableDefualtDict = DefaultDict[bytes, int]
 FrequencyTable = dict[bytes, int]
@@ -65,7 +66,7 @@ def find_chunk_boundaries(
                 if found_at >= 0 and (first_found_at is None or first_found_at > found_at):
                     first_found_at = found_at
             
-            if first_found_at:
+            if first_found_at is not None:
                 chunk_boundaries[bi] = initial_position + first_found_at
                 break
             initial_position += mini_chunk_size
@@ -74,25 +75,39 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def pretokenize(idx: int, start: int, end: int, data_file_path: str) -> FrequencyTable:
+def pretokenize(idx: int, start: int, end: int, data_file_path: str, special_tokens: list[str]) -> FrequencyTableDefualtDict:
     
+    pattern_split_special_token = re.compile(r'\L<tokens>', tokens=special_tokens)
+    ret = defaultdict(int)
     with open(data_file_path, "rb") as f:       
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
 
-    return defaultdict(int, {b"test": idx})
+        doc_match_iterable: Iterable
+        if special_tokens:
+            doc_match_iterable = pattern_split_special_token.splititer(chunk)
+        else:
+            doc_match_iterable = [chunk]
+
+        for doc_match in doc_match_iterable:
+            if len(doc_match) == 0:
+                continue
+            for m in PAT_REGEX.finditer(doc_match):
+                ret[m.group(0).encode('utf-8')] += 1
+
+    return ret
 
 def wrapped_pretokenize(args): return pretokenize(*args)
 
-def init_vocab() -> dict[int, bytes]:
+def init_vocab(special_tokens: list[str]) -> dict[int, bytes]:
     ret: dict[int, bytes] = {}
-    
-    # EndOfText
-    ret[0] = END_OF_TEXT_TOKEN
-    
-    for b in range(1 << 8):
-        ret[b + 1] = chr(b).encode('utf-8')
-    
+
+    for idx in range(1 << 8):
+        b = idx.to_bytes()
+        ret[idx] = b
+
+    for i, special_token in enumerate(special_tokens):
+        ret[i + (1 << 8)] = special_token.encode('utf-8')
     return ret
 
 def merge_frequency_table(lhs: FrequencyTableDefualtDict, rhs: FrequencyTable) -> FrequencyTableDefualtDict:
@@ -104,19 +119,42 @@ def merge_frequency_table(lhs: FrequencyTableDefualtDict, rhs: FrequencyTable) -
 def train_bpe(
     num_processes: int,
     data_file_path: str,
-    num_chunks: int
+    special_tokens: list[str],
+    num_chunks: int,
+    num_chunks_limit: int | None = None,
+    will_dump_freq_table_pkl: bool = True,
+    will_load_freq_table_pkl: bool = False,
 ):
+    freq_table: FrequencyTableDefualtDict = get_freq_table(
+        num_processes, data_file_path, special_tokens, num_chunks, num_chunks_limit, will_dump_freq_table_pkl, will_load_freq_table_pkl
+    )
+    
+    for subtoken, freq in itertools.islice(freq_table.items(), 10):
+        click.echo(f"'{subtoken}' -- {freq}")
+
+def get_freq_table(num_processes, data_file_path, special_tokens, num_chunks, num_chunks_limit, will_dump_freq_table_pkl, will_load_freq_table_pkl) -> FrequencyTableDefualtDict:
+    if will_load_freq_table_pkl:
+        click.echo("loading from pkl")
+        with open(FREQ_TABLE_PKL_FILEPATH, "rb") as f:
+            ret: FrequencyTableDefualtDict = pkl.load(f)
+        return ret
+
+    split_special_tokens = [x.encode('utf-8') for x in special_tokens]
     with open(data_file_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_chunks, [END_OF_TEXT_TOKEN])
+        boundaries = find_chunk_boundaries(f, num_chunks, split_special_tokens)
 
     freq_table: FrequencyTableDefualtDict = defaultdict(int)
 
+    params = [
+        (i, start_end_pair[0], start_end_pair[1], data_file_path, special_tokens)
+        for i, start_end_pair in enumerate(zip(boundaries[:-1], boundaries[1:]))
+    ]
+    
+    if num_chunks_limit is not None:
+        click.echo(f"found num_chunks_limit = {num_chunks_limit}, only use the first {num_chunks_limit} chunk(s)")
+        params = params[:num_chunks_limit]
+
     with mp.Pool(num_processes) as pool:
-        params = [
-            (i, start_end_pair[0], start_end_pair[1], data_file_path, q)
-            for i, start_end_pair in enumerate(zip(boundaries[:-1], boundaries[1:]))
-        ]
-        
         for partial_freq_table in tqdm(
             pool.imap_unordered(wrapped_pretokenize, params),
             total=len(params)
@@ -127,23 +165,32 @@ def train_bpe(
     click.echo(f"Number of chucks: {len(params)}")
     click.echo(f"Number of sub-tokens: {len(freq_table.keys())}")
     
+    # Dumps the ouput 
+    if will_dump_freq_table_pkl:
+        with open(FREQ_TABLE_PKL_FILEPATH, "wb") as f:
+            pkl.dump(freq_table, f)
+    
+    click.echo(f"freq_table constructed")
+    return freq_table
         
         
 @click.command()
 @click.option('--num-processes', default=4)
 @click.option('--data-file', 'data_file_path', type=click.Path(exists=True))
-@click.option('--num-chunks', default=20_000)
+@click.option('--num-chunks', default=10_000)
+@click.option('--num-chunks-limit', default=None, type=int)
 def run_train_bpe(
     num_processes: int,
     data_file_path: str,
     num_chunks: int,
+    num_chunks_limit: int | None
 ):
     click.echo(
         f"num_process = {num_processes}, data_file_path={data_file_path}"
     )
 
     start_ns = time.perf_counter_ns()
-    train_bpe(num_processes, data_file_path, num_chunks)
+    train_bpe(num_processes, data_file_path, [END_OF_TEXT_TOKEN], num_chunks, num_chunks_limit)
     end_ns = time.perf_counter_ns()
     
     click.echo(f"Total time (in ms): {(end_ns - start_ns) / (1_000_000)}")
