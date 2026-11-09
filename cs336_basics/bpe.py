@@ -9,6 +9,7 @@ from tqdm.std import trange, tqdm
 import click
 import pickle as pkl
 import itertools
+import pprint as pp
 
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -21,6 +22,11 @@ FrequencyTableDefualtDict = DefaultDict[bytes, int]
 FrequencyTable = dict[bytes, int]
 
 VocabTable = dict[int, bytes]
+MergeRecord = tuple[bytes, bytes]
+MergeRecordList = list[MergeRecord]
+
+PairFreqDefaultDict = DefaultDict[tuple[bytes, bytes], int]
+
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -118,21 +124,157 @@ def merge_frequency_table(lhs: FrequencyTableDefualtDict, rhs: FrequencyTable) -
 
 def train_bpe(
     num_processes: int,
-    data_file_path: str,
+    data_file_path: str | os.PathLike,
     special_tokens: list[str],
     num_chunks: int,
+    vocab_size: int,    
     num_chunks_limit: int | None = None,
-    will_dump_freq_table_pkl: bool = True,
+    will_dump_freq_table_pkl: bool = False,
     will_load_freq_table_pkl: bool = False,
+    is_debug: bool = False
 ):
     freq_table: FrequencyTableDefualtDict = get_freq_table(
         num_processes, data_file_path, special_tokens, num_chunks, num_chunks_limit, will_dump_freq_table_pkl, will_load_freq_table_pkl
     )
     
-    for subtoken, freq in itertools.islice(freq_table.items(), 10):
-        click.echo(f"'{subtoken}' -- {freq}")
+    if is_debug:
+        for subtoken, freq in itertools.islice(freq_table.items(), 10):
+            click.echo(f"'{subtoken}' -- {freq}")
+    
+    vocab = init_vocab(special_tokens)
+    subtoken_to_token_list: dict[bytes, list[bytes]] = dict()
 
-def get_freq_table(num_processes, data_file_path, special_tokens, num_chunks, num_chunks_limit, will_dump_freq_table_pkl, will_load_freq_table_pkl) -> FrequencyTableDefualtDict:
+    for subtoken in freq_table.keys():
+        subtoken_to_token_list[subtoken] = [x.to_bytes() for x in subtoken]
+    
+    num_init_vocab = len(vocab)
+    num_remaining_vocab = vocab_size - len(vocab)
+
+    merges: MergeRecordList = []
+    current_pair_freq: PairFreqDefaultDict | None = None
+    for i in range(num_remaining_vocab):
+        # pp.pprint(current_pair_freq)
+        current_pair_freq = find_most_freq_and_mergs(
+            vocab=vocab,
+            merges=merges,
+            subtoken_to_token_list=subtoken_to_token_list,
+            subtoken_freq_table = freq_table,
+            previous_pairs_freq=current_pair_freq,
+            new_idx=num_init_vocab + i,
+        )
+    
+    return vocab, merges
+
+def find_most_freq_and_mergs(
+    vocab: VocabTable,
+    merges: MergeRecordList,
+    subtoken_to_token_list: dict[bytes, list[bytes]],
+    subtoken_freq_table: dict[bytes, int],
+    previous_pairs_freq: PairFreqDefaultDict | None,
+    new_idx: int
+):
+    if previous_pairs_freq is None:
+        pairs_freq = count_pair_freq(subtoken_to_token_list, subtoken_freq_table)
+    else:
+        pairs_freq = previous_pairs_freq
+    
+    new_token_freq, pair_to_merge = find_pair_to_merge(pairs_freq)
+    
+    merges.append(pair_to_merge)
+    new_token = pair_to_merge[0] + pair_to_merge[1]
+    vocab[new_idx] = new_token
+    
+    merge_new_token_pair_to_single(
+        subtoken_to_token_list=subtoken_to_token_list,
+        subtoken_freq_table=subtoken_freq_table,
+        pair_to_merge=pair_to_merge,
+        pair_freq_table=pairs_freq,
+        new_token=new_token
+    )
+    
+    return pairs_freq
+    
+
+def merge_new_token_pair_to_single(
+    subtoken_to_token_list,
+    subtoken_freq_table,
+    pair_to_merge,
+    pair_freq_table: PairFreqDefaultDict,
+    new_token
+):
+
+    for subtoken, subtoken_freq in subtoken_freq_table.items():
+        # PRECONDITION: len(new_token) >= 2
+        if new_token in subtoken:
+            new_token_list = []
+            old_token_list = subtoken_to_token_list[subtoken]
+
+            for token_idx, token in enumerate(old_token_list):
+                new_token_list.append(token)
+                
+                if len(new_token_list) >= 2:
+                    w = tuple(new_token_list[-2:])
+                    if w == pair_to_merge:
+                        new_token_list.pop()
+                        new_token_list.pop()
+                        new_token_list.append(new_token)
+                        pair_freq_table[pair_to_merge] -= subtoken_freq
+                        
+                        # (prev?, fst, sec, next?) -> (prev?, fst-sec, next?)
+                        if len(new_token_list) >= 2:
+                            # (prev, fst, sec)
+                            old_pair = (new_token_list[-2], pair_to_merge[0])
+                            if old_pair in pair_freq_table:
+                                pair_freq_table[old_pair] -= subtoken_freq
+                                if (pair_freq_table[old_pair] == 0):
+                                    del pair_freq_table[old_pair]
+                            pair_freq_table[(new_token_list[-2], new_token)] += subtoken_freq
+
+                        if token_idx < len(old_token_list) - 1:
+                            # (fst, sec, next)
+                            old_pair = (pair_to_merge[1], old_token_list[token_idx + 1])
+                            if old_pair in pair_freq_table:
+                                pair_freq_table[old_pair] -= subtoken_freq
+                                if (pair_freq_table[old_pair] == 0):
+                                    del pair_freq_table[old_pair]
+                            pair_freq_table[(new_token, old_token_list[token_idx + 1])] += subtoken_freq
+
+            subtoken_to_token_list[subtoken] = new_token_list
+    
+    assert pair_freq_table[pair_to_merge] == 0
+    del pair_freq_table[pair_to_merge]
+
+
+def find_pair_to_merge(pairs_freq: PairFreqDefaultDict):
+    max_freq = -1
+    max_freq_candidates: list[MergeRecord] = []
+    for p, freq in pairs_freq.items():
+        if freq > max_freq:
+            max_freq = freq
+            max_freq_candidates = [p]
+        elif freq == max_freq:
+            max_freq_candidates.append(p)
+    pair_to_merge = max(max_freq_candidates)
+    return max_freq, pair_to_merge
+    
+    
+
+def count_pair_freq(subtoken_to_token_list, subtoken_freq_table):
+    pairs_freq: PairFreqDefaultDict = defaultdict(int)
+    
+    for subtoken, freq in subtoken_freq_table.items():
+        subtoken_token_list = subtoken_to_token_list[subtoken]
+        for lhs, rhs in zip(subtoken_token_list[:-1], subtoken_token_list[1:]):
+            pairs_freq[(lhs, rhs)] += freq
+    return pairs_freq
+    
+    
+        
+    
+
+def get_freq_table(
+    num_processes, data_file_path, special_tokens, num_chunks, num_chunks_limit, will_dump_freq_table_pkl, will_load_freq_table_pkl
+) -> FrequencyTableDefualtDict:
     if will_load_freq_table_pkl:
         click.echo("loading from pkl")
         with open(FREQ_TABLE_PKL_FILEPATH, "rb") as f:
@@ -179,18 +321,27 @@ def get_freq_table(num_processes, data_file_path, special_tokens, num_chunks, nu
 @click.option('--data-file', 'data_file_path', type=click.Path(exists=True))
 @click.option('--num-chunks', default=10_000)
 @click.option('--num-chunks-limit', default=None, type=int)
+@click.option('--vocab-size', default=10_000)
 def run_train_bpe(
     num_processes: int,
     data_file_path: str,
     num_chunks: int,
-    num_chunks_limit: int | None
+    num_chunks_limit: int | None,
+    vocab_size: int
 ):
     click.echo(
         f"num_process = {num_processes}, data_file_path={data_file_path}"
     )
 
     start_ns = time.perf_counter_ns()
-    train_bpe(num_processes, data_file_path, [END_OF_TEXT_TOKEN], num_chunks, num_chunks_limit)
+    train_bpe(
+        num_processes=num_processes,
+        data_file_path=data_file_path, 
+        special_tokens=[END_OF_TEXT_TOKEN],
+        num_chunks=num_chunks,
+        num_chunks_limit=num_chunks_limit,
+        vocab_size=vocab_size,
+    )
     end_ns = time.perf_counter_ns()
     
     click.echo(f"Total time (in ms): {(end_ns - start_ns) / (1_000_000)}")
